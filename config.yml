@@ -1,0 +1,17 @@
+output_format:
+  - json
+  - yaml
+
+datasource:
+  - influxdb
+  - prometheus
+
+labels:
+  - host
+  - name
+  - env
+  - namespace
+  - pod
+
+target:
+  - dashboards

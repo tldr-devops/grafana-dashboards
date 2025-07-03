@@ -2,6 +2,9 @@
 """
 Grafana Template Builder & Converter
 
+A tool for building Grafana dashboards from Jinja2 templates and converting 
+existing dashboards into reusable templates.
+
 Usage:
   # Build templates into dashboards/alerts/... outputs
   python3 builder.py build --config config.yml --templates templates --output output
@@ -19,193 +22,377 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, select_autoescape, pass_context
 from markupsafe import Markup
 
-# Initialize Jinja2 environment
-env = Environment(
-    #autoescape=select_autoescape(["j2", "jinja2"]),
-    variable_start_string='@{', # instead of {{ ... }}
+# Initialize Jinja2 environment with custom delimiters to avoid conflicts
+# with Grafana's variable syntax
+jinja_env = Environment(
+    # Use @{ }@ instead of {{ }} to avoid conflicts with Grafana variables
+    variable_start_string='@{',
     variable_end_string='}@',
     trim_blocks=True,
     lstrip_blocks=True,
     autoescape=False
 )
 
-def setup_loader(templates_dir):
-    env.loader = FileSystemLoader(str(templates_dir))
+def setup_template_loader(templates_directory):
+    """Set up the Jinja2 template loader for the specified directory."""
+    jinja_env.loader = FileSystemLoader(str(templates_directory))
 
 @pass_context
 def to_nice_yaml(context, value, indent=2):
-    """Jinja2 filter: convert dict/list to nice YAML"""
-    return yaml.dump(value, default_flow_style=False, sort_keys=False, indent=indent, allow_unicode=True)
+    """
+    Jinja2 filter: Convert dict/list to nicely formatted YAML.
 
-env.filters["to_nice_yaml"] = to_nice_yaml
+    Args:
+        context: Jinja2 context (automatically passed)
+        value: The value to convert to YAML
+        indent: Number of spaces for indentation
 
-def write_yaml(data):
-    return to_nice_yaml(None, data, indent=2).replace("'@{", "@{").replace("}@'", "}@")
+    Returns:
+        str: Formatted YAML string
+    """
+    return yaml.dump(value, default_flow_style=False, sort_keys=False, 
+                    indent=indent, allow_unicode=True)
 
-# Globals for label generation
-def prom_labels(labels):
-    parts = [f'{lbl}="${{{lbl}}}"' for lbl in labels]
-    return Markup(", ".join(parts))
+# Register the custom filter
+jinja_env.filters["to_nice_yaml"] = to_nice_yaml
 
-env.globals['prom_labels'] = prom_labels
+def write_yaml_content(data):
+    """
+    Write data as YAML with proper handling of Jinja2 variables.
 
-def influx_labels(labels):
-    parts = [f"{lbl} = '${{{lbl}}}'" for lbl in labels]
-    return Markup(" AND ".join(parts))
-env.globals['influx_labels'] = influx_labels
+    Args:
+        data: Data to convert to YAML
 
+    Returns:
+        str: YAML string with unescaped Jinja2 variables
+    """
+    yaml_content = to_nice_yaml(None, data, indent=2)
+    # Unescape Jinja2 variables that were quoted by YAML
+    return yaml_content.replace("'@{", "@{").replace("}@'", "}@")
 
-def load_config(path):
-    with open(path) as f:
-        return yaml.safe_load(f)
+def create_prometheus_labels(labels):
+    """
+    Generate Prometheus label selector string from label list.
 
+    Args:
+        labels: List of label names
 
-def render_template(path, context):
-    tpl = env.get_template(path)
-    return tpl.render(**context)
+    Returns:
+        Markup: Prometheus-formatted label selector
+    """
+    label_parts = [f'{label}="${{{label}}}"' for label in labels]
+    return Markup(", ".join(label_parts))
 
+def create_influxdb_labels(labels):
+    """
+    Generate InfluxDB WHERE clause from label list.
 
-def render_yaml_template(path, context):
-    rendered = render_template(path, context)
-    # print(rendered)
-    return yaml.safe_load(rendered)
+    Args:
+        labels: List of label names
 
+    Returns:
+        Markup: InfluxDB-formatted WHERE clause
+    """
+    label_parts = [f"{label} = '${{{label}}}'" for label in labels]
+    return Markup(" AND ".join(label_parts))
 
-def build_all(config, templates_dir, output_dir):
+# Register global functions for templates
+jinja_env.globals['prom_labels'] = create_prometheus_labels
+jinja_env.globals['influx_labels'] = create_influxdb_labels
+
+def load_configuration(config_path):
+    """
+    Load YAML configuration file.
+
+    Args:
+        config_path: Path to the configuration file
+
+    Returns:
+        dict: Configuration data
+    """
+    with open(config_path) as config_file:
+        return yaml.safe_load(config_file)
+
+def render_template(template_path, context):
+    """
+    Render a Jinja2 template with the given context.
+
+    Args:
+        template_path: Path to the template file
+        context: Template context variables
+
+    Returns:
+        str: Rendered template content
+    """
+    template = jinja_env.get_template(template_path)
+    return template.render(**context)
+
+def render_yaml_template(template_path, context):
+    """
+    Render a YAML template and parse it as YAML.
+
+    Args:
+        template_path: Path to the template file
+        context: Template context variables
+
+    Returns:
+        dict: Parsed YAML data
+    """
+    rendered_content = render_template(template_path, context)
+    return yaml.safe_load(rendered_content)
+
+def build_all_templates(config, templates_dir, output_dir):
+    """
+    Build all templates for all configured datasources and output formats.
+
+    Args:
+        config: Configuration dictionary
+        templates_dir: Directory containing template files
+        output_dir: Directory for output files
+    """
     datasources = config.get('datasource', [])
     labels = config.get('labels', [])
-    formats = config.get('output_format', [])
-    targets = config.get('target', [])
+    output_formats = config.get('output_format', [])
+    target_types = config.get('target', [])
 
-    setup_loader(templates_dir)
-    type_dirs = sorted([d for d in Path(templates_dir).iterdir() if d.is_dir()], key=lambda p: p.name)
+    setup_template_loader(templates_dir)
 
-    for ds in datasources:
-        ctx = {'datasource': ds, 'labels': labels}
-        for d in type_dirs:
-            ctx[d.name.split('_',1)[1]] = {}
-        for d in type_dirs:
-            key = d.name.split('_',1)[1]
-            for tpl in sorted(d.glob("*.yml.j2"), key=lambda p: p.name):
-                print(f"Proceed {tpl}")
-                # if tpl.name.startswith("_"): continue
-                rel = tpl.relative_to(templates_dir)
-                data = render_yaml_template(str(rel), ctx)
-                name = tpl.stem[:-4]
-                ctx[key][name] = data
-        for fmt in formats:
-            ext = 'json' if fmt=='json' else 'yaml'
-            for t in targets:
-                items = ctx.get(t, {})
-                for name, data in items.items():
-                    if name.startswith("_"): continue
-                    path = Path(output_dir)/fmt/ ds / t
-                    path.mkdir(parents=True, exist_ok=True)
-                    dst = path/f"{name}.{ext}"
-                    with open(dst,'w') as f:
-                        if fmt=='json': json.dump(data, f, indent=2, ensure_ascii=False)
-                        else: yaml.dump(data, f, sort_keys=False, allow_unicode=True)
-                    print(f"[✓] Saved {dst}")
+    # Get all template type directories (e.g., 01_targets, 02_panels, etc.)
+    template_type_dirs = sorted([d for d in Path(templates_dir).iterdir() if d.is_dir()], 
+                               key=lambda p: p.name)
 
+    # Process each datasource
+    for datasource in datasources:
+        print(f"Processing datasource: {datasource}")
 
-def convert_dashboard(input_path, templates_dir):
-    p = Path(input_path)
-    data = yaml.safe_load(open(input_path)) if p.suffix.lower() in ['.yml','.yaml'] else json.load(open(input_path))
+        # Initialize context with datasource and labels
+        template_context = {'datasource': datasource, 'labels': labels}
 
-    # Directories to create
-    dirs = ["01_targets", "01_variables", "01_inputs", "02_panels", "03_rows", "04_dashboards"]
-    for d in dirs:
-        Path(templates_dir, d).mkdir(parents=True, exist_ok=True)
+        # Initialize empty dictionaries for each template type
+        for template_dir in template_type_dirs:
+            template_type = template_dir.name.split('_', 1)[1]
+            template_context[template_type] = {}
 
-    # 2) Variables
-    vars_list = data.get('templating', {}).get('list', [])
-    jinja_list = []
-    for var in vars_list:
-        name = var.get('name', uuid.uuid4())
-        path = Path(templates_dir)/"01_variables"/f"{name}.yml.j2"
-        with open(path,'w') as f:
-            f.write(f"# Variable template: {name}\n")
-            f.write(write_yaml(var))
-        jinja_list.append("@{ variables[\"%s\"] | to_nice_yaml | indent(4, false) }@" % name)
-    if jinja_list:
-        data['templating']['list'] = jinja_list
+        # Process each template type directory
+        for template_dir in template_type_dirs:
+            template_type = template_dir.name.split('_', 1)[1]
 
-    # 3) Inputs (datasources)
-    ds_inputs = data.get('__inputs', [])
-    jinja_inputs = []
-    for inp in ds_inputs:
-        name = inp.get('name', inp.get('pluginId', 'ds'))
-        path = Path(templates_dir)/"01_inputs"/f"{name}.yml.j2"
-        with open(path,'w') as f:
-            f.write(f"# Datasource template: {name}\n")
-            f.write(write_yaml(inp))
-        jinja_inputs.append("@{ inputs[\"%s\"] | to_nice_yaml | indent(2, false) }@" % name)
-    if jinja_inputs:
-        data['__inputs'] = jinja_inputs
+            # Process all .yml.j2 files in the directory
+            for template_file in sorted(template_dir.glob("*.yml.j2"), key=lambda p: p.name):
+                print(f"Processing template: {template_file}")
 
-    # 1) Queries and 4) Panels
-    def process_panels(panels):
-        jinja_panels = []
+                # Get relative path and render template
+                relative_path = template_file.relative_to(templates_dir)
+                rendered_data = render_yaml_template(str(relative_path), template_context)
+
+                # Extract name without .yml.j2 extension
+                template_name = template_file.stem[:-4]  # Remove .yml.j2
+                template_context[template_type][template_name] = rendered_data
+
+        # Generate output files in requested formats
+        for output_format in output_formats:
+            file_extension = 'json' if output_format == 'json' else 'yaml'
+
+            for target_type in target_types:
+                target_items = template_context.get(target_type, {})
+
+                for item_name, item_data in target_items.items():
+                    # Skip private templates (starting with _)
+                    if item_name.startswith("_"):
+                        continue
+
+                    # Create output directory structure
+                    output_path = Path(output_dir) / output_format / datasource / target_type
+                    output_path.mkdir(parents=True, exist_ok=True)
+
+                    # Write output file
+                    output_file = output_path / f"{item_name}.{file_extension}"
+                    with open(output_file, 'w') as f:
+                        if output_format == 'json':
+                            json.dump(item_data, f, indent=2, ensure_ascii=False)
+                        else:
+                            yaml.dump(item_data, f, sort_keys=False, allow_unicode=True)
+
+                    print(f"[✓] Saved {output_file}")
+
+def convert_dashboard_to_templates(input_path, templates_dir):
+    """
+    Convert an existing Grafana dashboard JSON/YAML into Jinja2 templates.
+
+    Args:
+        input_path: Path to the input dashboard file
+        templates_dir: Directory to save generated templates
+    """
+    input_file = Path(input_path)
+
+    # Load dashboard data (JSON or YAML)
+    if input_file.suffix.lower() in ['.yml', '.yaml']:
+        dashboard_data = yaml.safe_load(open(input_path))
+    else:
+        dashboard_data = json.load(open(input_path))
+
+    # Create template directory structure
+    template_directories = [
+        "01_targets",     # Query targets
+        "01_variables",   # Dashboard variables
+        "01_inputs",      # Datasource inputs
+        "02_panels",      # Individual panels
+        "03_rows",        # Row panels
+        "04_dashboards"   # Complete dashboards
+    ]
+
+    for directory in template_directories:
+        Path(templates_dir, directory).mkdir(parents=True, exist_ok=True)
+
+    # Process dashboard variables
+    variables_list = dashboard_data.get('templating', {}).get('list', [])
+    jinja_variables_list = []
+
+    for variable in variables_list:
+        variable_name = variable.get('name', str(uuid.uuid4()))
+        variable_template_path = Path(templates_dir) / "01_variables" / f"{variable_name}.yml.j2"
+
+        with open(variable_template_path, 'w') as f:
+            f.write(f"# Variable template: {variable_name}\n")
+            f.write(write_yaml_content(variable))
+
+        jinja_variables_list.append(f"@{{ variables[\"{variable_name}\"] | to_nice_yaml | indent(4, false) }}@")
+
+    if jinja_variables_list:
+        dashboard_data['templating']['list'] = jinja_variables_list
+
+    # Process datasource inputs
+    datasource_inputs = dashboard_data.get('__inputs', [])
+    jinja_inputs_list = []
+
+    for input_config in datasource_inputs:
+        input_name = input_config.get('name', input_config.get('pluginId', 'ds'))
+        input_template_path = Path(templates_dir) / "01_inputs" / f"{input_name}.yml.j2"
+
+        with open(input_template_path, 'w') as f:
+            f.write(f"# Datasource template: {input_name}\n")
+            f.write(write_yaml_content(input_config))
+
+        jinja_inputs_list.append(f"@{{ inputs[\"{input_name}\"] | to_nice_yaml | indent(2, false) }}@")
+
+    if jinja_inputs_list:
+        dashboard_data['__inputs'] = jinja_inputs_list
+
+    def process_panel_list(panels):
+        """
+        Recursively process panels and their queries, creating templates.
+
+        Args:
+            panels: List of panel dictionaries
+
+        Returns:
+            list: List of Jinja2 template references
+        """
+        jinja_panels_list = []
+
         for panel in panels:
-            panel_id = panel.get('uid') or str(panel.get('id'))
-            jinja_targets = []
-            for index, target in enumerate(panel.get('targets', [])):
-                query_id = f"{panel_id}_t{index}"
-                path = Path(templates_dir)/"01_targets"/f"{query_id}.yml.j2"
-                with open(path,'w') as f:
-                    f.write(f"# Query template: {query_id}\n")
-                    f.write(write_yaml(target))
-                jinja_targets.append("@{ targets[\"%s\"] | to_nice_yaml | indent(2, false) }@" % query_id)
-            if jinja_targets:
-                panel['targets'] = jinja_targets
+            panel_id = panel.get('uid') or str(panel.get('id', uuid.uuid4()))
 
+            # Process panel queries/targets
+            jinja_targets_list = []
+            for target_index, target in enumerate(panel.get('targets', [])):
+                query_id = f"{panel_id}_t{target_index}"
+                query_template_path = Path(templates_dir) / "01_targets" / f"{query_id}.yml.j2"
+
+                with open(query_template_path, 'w') as f:
+                    f.write(f"# Query template: {query_id}\n")
+                    f.write(write_yaml_content(target))
+
+                jinja_targets_list.append(f"@{{ targets[\"{query_id}\"] | to_nice_yaml | indent(2, false) }}@")
+
+            if jinja_targets_list:
+                panel['targets'] = jinja_targets_list
+
+            # Handle nested panels (for row panels)
             subpanels = panel.get('panels', [])
             if subpanels:
-                path = Path(templates_dir)/"03_rows"/f"{panel_id}.yml.j2"
-                jinja_panels.append("@{ rows[\"%s\"] | to_nice_yaml | indent(2, false) }@" % panel_id)
-                panel['panels'] = process_panels(subpanels)
+                # This is a row panel
+                panel_template_path = Path(templates_dir) / "03_rows" / f"{panel_id}.yml.j2"
+                jinja_panels_list.append(f"@{{ rows[\"{panel_id}\"] | to_nice_yaml | indent(2, false) }}@")
+                panel['panels'] = process_panel_list(subpanels)
             else:
-                path = Path(templates_dir)/"02_panels"/f"{panel_id}.yml.j2"
-                jinja_panels.append("@{ panels[\"%s\"] | to_nice_yaml | indent(2, false) }@" % panel_id)
+                # This is a regular panel
+                panel_template_path = Path(templates_dir) / "02_panels" / f"{panel_id}.yml.j2"
+                jinja_panels_list.append(f"@{{ panels[\"{panel_id}\"] | to_nice_yaml | indent(2, false) }}@")
 
-            # panel.pop('gridPos', None)
-            with open(path,'w') as f:
+            # Save panel template
+            with open(panel_template_path, 'w') as f:
                 f.write(f"# Panel template: {panel_id}\n")
-                f.write(write_yaml(panel))
-        return jinja_panels
-    panels = data.get('panels', [])
-    if panels:
-        data['panels'] = process_panels(panels)
+                f.write(write_yaml_content(panel))
 
-    # 6) Dashboard
-    name = data.get('title','dashboard').lower().replace(' ','_')
-    path = Path(templates_dir)/"04_dashboards"/f"{name}.yml.j2"
-    with open(path,'w') as f:
-        f.write(f"# Dashboard template: {data.get('title')}\n")
-        f.write(write_yaml(data))
-    # print(data)
+        return jinja_panels_list
+
+    # Process all panels
+    panels = dashboard_data.get('panels', [])
+    if panels:
+        dashboard_data['panels'] = process_panel_list(panels)
+
+    # Save main dashboard template
+    dashboard_name = dashboard_data.get('title', 'dashboard').lower().replace(' ', '_')
+    dashboard_template_path = Path(templates_dir) / "04_dashboards" / f"{dashboard_name}.yml.j2"
+
+    with open(dashboard_template_path, 'w') as f:
+        f.write(f"# Dashboard template: {dashboard_data.get('title', 'Unknown Dashboard')}\n")
+        f.write(write_yaml_content(dashboard_data))
+
     print(f"[✓] Converted {input_path} -> {templates_dir}")
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Grafana Template Builder & Converter")
-    sub = parser.add_subparsers(dest='cmd', required=True)
+    """Main entry point for the CLI application."""
+    parser = argparse.ArgumentParser(
+        description="Grafana Template Builder & Converter",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Build templates into outputs
+  python3 builder.py build --config config.yml --templates templates --output output
 
-    p_build = sub.add_parser('build', help='Build templates into outputs')
-    p_build.add_argument('--config', default='config.yml')
-    p_build.add_argument('--templates', default='templates')
-    p_build.add_argument('--output', default='output')
+  # Convert existing dashboard to templates
+  python3 builder.py convert --input dashboard.json --templates templates
+        """
+    )
 
-    p_conv = sub.add_parser('convert', help='Convert Grafana dashboard JSON or YAML into templates')
-    p_conv.add_argument('--input', required=True, help='Path to dashboard.json or dashboard.yml')
-    p_conv.add_argument('--templates', default='templates')
+    subparsers = parser.add_subparsers(dest='command', required=True, help='Available commands')
+
+    # Build command
+    build_parser = subparsers.add_parser('build', help='Build templates into outputs')
+    build_parser.add_argument('--config', default='config.yml', 
+                             help='Configuration file path (default: config.yml)')
+    build_parser.add_argument('--templates', default='templates', 
+                             help='Templates directory path (default: templates)')
+    build_parser.add_argument('--output', default='output', 
+                             help='Output directory path (default: output)')
+
+    # Convert command
+    convert_parser = subparsers.add_parser('convert', 
+                                          help='Convert Grafana dashboard JSON or YAML into templates')
+    convert_parser.add_argument('--input', required=True, 
+                               help='Path to dashboard.json or dashboard.yml file')
+    convert_parser.add_argument('--templates', default='templates', 
+                               help='Templates directory path (default: templates)')
 
     args = parser.parse_args()
-    if args.cmd == 'build':
-        cfg = load_config(args.config)
-        build_all(cfg, args.templates, args.output)
-    elif args.cmd == 'convert':
-        convert_dashboard(args.input, args.templates)
+
+    try:
+        if args.command == 'build':
+            configuration = load_configuration(args.config)
+            build_all_templates(configuration, args.templates, args.output)
+            print("✓ Build completed successfully!")
+
+        elif args.command == 'convert':
+            convert_dashboard_to_templates(args.input, args.templates)
+            print("✓ Conversion completed successfully!")
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return 1
+
+    return 0
 
 if __name__ == '__main__':
-    main()
+    exit(main())
